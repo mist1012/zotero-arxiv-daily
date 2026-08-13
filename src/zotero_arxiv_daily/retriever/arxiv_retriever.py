@@ -1,8 +1,10 @@
 from .base import BaseRetriever, register_retriever
+
 import arxiv
 from arxiv import Result as ArxivResult
 from ..protocol import Paper
 from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
+
 from tempfile import TemporaryDirectory
 import feedparser
 from tqdm import tqdm
@@ -12,6 +14,7 @@ import re
 from queue import Empty
 from time import sleep
 from typing import Any, Callable, TypeVar
+
 from loguru import logger
 import requests
 
@@ -26,12 +29,14 @@ TAR_EXTRACT_TIMEOUT = 180
 # ============================================================
 # Strict venue filter
 #
-# Only papers that can be clearly confirmed as accepted by or
-# published in the following conferences/journals will pass.
+# Only papers associated with the following conferences/journals
+# are allowed to continue to full-text processing and reranking.
 # ============================================================
 
 VENUE_PATTERNS = {
+    # --------------------------------------------------------
     # Robotics / Embodied AI conferences
+    # --------------------------------------------------------
     "ICRA": (
         r"\bICRA\b"
         r"|International Conference on Robotics and Automation"
@@ -50,7 +55,9 @@ VENUE_PATTERNS = {
         r"|Conference on Robot Learning"
     ),
 
+    # --------------------------------------------------------
     # Computer Vision conferences
+    # --------------------------------------------------------
     "CVPR": (
         r"\bCVPR\b"
         r"|Conference on Computer Vision and Pattern Recognition"
@@ -64,7 +71,9 @@ VENUE_PATTERNS = {
         r"|European Conference on Computer Vision"
     ),
 
+    # --------------------------------------------------------
     # Robotics journals
+    # --------------------------------------------------------
     "IEEE RA-L": (
         r"\bRA-?L\b"
         r"|\bRAL\b"
@@ -83,7 +92,9 @@ VENUE_PATTERNS = {
         r"Science Robotics"
     ),
 
+    # --------------------------------------------------------
     # Computer Vision journals
+    # --------------------------------------------------------
     "TPAMI": (
         r"\bTPAMI\b"
         r"|\bPAMI\b"
@@ -96,8 +107,13 @@ VENUE_PATTERNS = {
 }
 
 
-# Workshop / Demo / Extended Abstract do NOT count as
-# main-conference or journal papers.
+# ============================================================
+# Papers of these types do NOT count.
+#
+# Even if "CVPR", "ICRA", etc. appears in the comment,
+# workshop/demo/extended abstract papers are rejected.
+# ============================================================
+
 EXCLUDED_PAPER_TYPES = re.compile(
     r"\bworkshop\b"
     r"|\bdemo\b"
@@ -107,8 +123,10 @@ EXCLUDED_PAPER_TYPES = re.compile(
 )
 
 
-# Explicit evidence that the paper has already been accepted
-# or published.
+# ============================================================
+# Explicit evidence that the paper is accepted / published.
+# ============================================================
+
 ACCEPTED_MARKERS = re.compile(
     r"\baccepted\b"
     r"|\bto appear\b"
@@ -121,7 +139,10 @@ ACCEPTED_MARKERS = re.compile(
 )
 
 
-# Evidence that the paper is only submitted / under review.
+# ============================================================
+# Explicit evidence that the paper has NOT yet been accepted.
+# ============================================================
+
 REJECTED_MARKERS = re.compile(
     r"\bsubmitted\b"
     r"|\bsubmission\b"
@@ -132,14 +153,45 @@ REJECTED_MARKERS = re.compile(
 )
 
 
+# ============================================================
+# Conferences for which:
+#
+#     "IROS 2026"
+#     "ICRA 2026"
+#     "CVPR 2026"
+#
+# is considered sufficient evidence,
+# as long as submitted / under review / workshop etc.
+# does NOT appear.
+#
+# Journals remain stricter.
+# ============================================================
+
+CONFERENCE_VENUES = {
+    "ICRA",
+    "IROS",
+    "RSS",
+    "CoRL",
+    "CVPR",
+    "ICCV",
+    "ECCV",
+}
+
+
 def _match_whitelist_venue(text: str) -> str | None:
     """
-    Match venue metadata against the whitelist.
+    Match text against the venue whitelist.
 
-    Returns canonical venue name, e.g.:
-        IROS
-        ECCV
-        IEEE RA-L
+    Examples:
+
+        "Accepted to IROS 2026"
+            -> "IROS"
+
+        "IEEE Robotics and Automation Letters"
+            -> "IEEE RA-L"
+
+        "European Conference on Computer Vision 2026"
+            -> "ECCV"
 
     Returns None if no whitelisted venue is found.
     """
@@ -147,7 +199,11 @@ def _match_whitelist_venue(text: str) -> str | None:
         return None
 
     for venue, pattern in VENUE_PATTERNS.items():
-        if re.search(pattern, text, flags=re.IGNORECASE):
+        if re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        ):
             return venue
 
     return None
@@ -155,12 +211,18 @@ def _match_whitelist_venue(text: str) -> str | None:
 
 def _extract_year(text: str) -> str | None:
     """
-    Try to extract a publication year from venue metadata.
+    Extract a four-digit publication year.
+
+    Example:
+        "IROS 2026" -> "2026"
     """
     if not text:
         return None
 
-    match = re.search(r"\b(20\d{2})\b", text)
+    match = re.search(
+        r"\b(20\d{2})\b",
+        text,
+    )
 
     if match:
         return match.group(1)
@@ -173,25 +235,20 @@ def _canonical_venue_with_year(
     text: str,
 ) -> str:
     """
-    Add conference year when available.
+    Add year to conference venue names when available.
 
     Examples:
-        IROS + "... IROS 2026 ..." -> "IROS 2026"
-        ECCV + "... ECCV 2026 ..." -> "ECCV 2026"
 
-    Journal names are kept without appending a year.
+        IROS + "IROS 2026"
+            -> "IROS 2026"
+
+        ECCV + "Accepted to ECCV 2026"
+            -> "ECCV 2026"
+
+        IEEE RA-L
+            -> "IEEE RA-L"
     """
-    conference_venues = {
-        "ICRA",
-        "IROS",
-        "RSS",
-        "CoRL",
-        "CVPR",
-        "ICCV",
-        "ECCV",
-    }
-
-    if venue not in conference_venues:
+    if venue not in CONFERENCE_VENUES:
         return venue
 
     year = _extract_year(text)
@@ -206,50 +263,135 @@ def _confirmed_venue_from_comment(
     comment: str,
 ) -> str | None:
     """
-    Conservatively inspect the arXiv comment.
+    Inspect the arXiv comment.
 
-    Requirements:
+    Conference rules
+    ----------------
 
-    1. Venue must be in the whitelist.
-    2. The same segment must contain evidence such as
-       "accepted", "to appear", "published", etc.
-    3. "submitted", "under review", etc. do NOT count.
-    4. Workshop / Demo / Extended Abstract are rejected.
+    PASS:
 
-    This prevents cases such as:
+        Accepted to IROS 2026
 
-        "Accepted elsewhere. Submitted to IROS 2026"
+        Accepted at ICRA 2026
 
-    from being incorrectly classified as an IROS paper.
+        ECCV 2026 Oral
+
+        CVPR 2026 Highlight
+
+        IEEE/RSJ International Conference on
+        Intelligent Robots and Systems (IROS 2026)
+
+        IROS 2026
+
+
+    REJECT:
+
+        Submitted to IROS 2026
+
+        Under review at CVPR 2026
+
+        CVPR 2026 Workshop
+
+        ICRA Workshop 2026
+
+        IROS 2026 Demo Paper
+
+
+    Important:
+
+    For conferences, an explicit venue + year is enough
+    even if the word "accepted" is absent.
+
+    For journals, merely mentioning the journal name in
+    the comment is NOT enough. Explicit accepted/published
+    evidence is still required.
+
+    Formal journal_ref metadata is handled separately in
+    get_confirmed_venue().
     """
     if not comment:
         return None
 
-    # Reject workshop/demo-style papers globally.
+    # --------------------------------------------------------
+    # Reject workshop/demo/extended abstract globally.
+    # --------------------------------------------------------
+
     if EXCLUDED_PAPER_TYPES.search(comment):
         return None
 
-    # Split comments into smaller segments so acceptance evidence
-    # must appear close to the matched venue.
-    segments = re.split(r"[.;\n]+", comment)
+    # --------------------------------------------------------
+    # Comments can contain several statements.
+    #
+    # We inspect them separately so something like:
+    #
+    #   "Accepted elsewhere. Submitted to IROS 2026."
+    #
+    # cannot accidentally become IROS PASS.
+    # --------------------------------------------------------
+
+    segments = re.split(
+        r"[.;\n]+",
+        comment,
+    )
 
     for segment in segments:
-        venue = _match_whitelist_venue(segment)
+        segment = segment.strip()
+
+        if not segment:
+            continue
+
+        venue = _match_whitelist_venue(
+            segment
+        )
 
         if venue is None:
             continue
 
-        # Explicit submission/under-review language means this
-        # segment is not proof of acceptance.
+        # ----------------------------------------------------
+        # Submitted / Under review always loses.
+        # ----------------------------------------------------
+
         if REJECTED_MARKERS.search(segment):
             continue
 
-        # Require explicit acceptance/publication evidence.
+        # ----------------------------------------------------
+        # Explicit acceptance/publication always passes.
+        # ----------------------------------------------------
+
         if ACCEPTED_MARKERS.search(segment):
             return _canonical_venue_with_year(
                 venue,
                 segment,
             )
+
+        # ----------------------------------------------------
+        # NEW RULE:
+        #
+        # Conference + explicit year also passes.
+        #
+        # Examples:
+        #
+        #   IROS 2026
+        #
+        #   IEEE/RSJ International Conference on Intelligent
+        #   Robots and Systems (IROS 2026)
+        #
+        #   CVPR 2026
+        #
+        # But:
+        #
+        #   Submitted to IROS 2026
+        #
+        # was already rejected above.
+        # ----------------------------------------------------
+
+        if venue in CONFERENCE_VENUES:
+            year = _extract_year(
+                segment
+            )
+
+            if year is not None:
+                return f"{venue} {year}"
 
     return None
 
@@ -262,38 +404,51 @@ def get_confirmed_venue(
 
     Rules:
 
-    1. journal_ref is regarded as formal publication evidence
+    1. journal_ref is considered formal publication evidence
        if it matches the whitelist.
 
-    2. arXiv comment must explicitly state accepted /
-       published / to appear / oral / spotlight / highlight.
+    2. For arXiv comments:
+         - accepted / published / to appear -> PASS
+         - conference + year -> PASS
+         - submitted / under review -> REJECT
+         - workshop / demo -> REJECT
 
-    3. Workshop / Demo / Extended Abstract are rejected.
-
-    4. Submitted / Under Review papers are rejected.
+    3. Journals in comments remain strict:
+       explicit acceptance/publication wording is required.
 
     Returns:
-        canonical venue name if confirmed, otherwise None.
+        Canonical venue string or None.
     """
+
     journal_ref = (
-        getattr(paper, "journal_ref", None)
+        getattr(
+            paper,
+            "journal_ref",
+            None,
+        )
         or ""
     )
 
     comment = (
-        getattr(paper, "comment", None)
+        getattr(
+            paper,
+            "comment",
+            None,
+        )
         or ""
     )
 
     # --------------------------------------------------------
-    # First check journal_ref.
+    # First check formal journal_ref.
     #
-    # journal_ref normally indicates formal publication, so
-    # explicit "accepted" wording is not required here.
+    # journal_ref normally indicates that publication metadata
+    # has already been registered on arXiv.
     # --------------------------------------------------------
 
     if journal_ref:
-        if not EXCLUDED_PAPER_TYPES.search(journal_ref):
+        if not EXCLUDED_PAPER_TYPES.search(
+            journal_ref
+        ):
             venue = _match_whitelist_venue(
                 journal_ref
             )
@@ -305,7 +460,7 @@ def get_confirmed_venue(
                 )
 
     # --------------------------------------------------------
-    # Otherwise inspect arXiv comment using strict rules.
+    # Otherwise inspect arXiv comments.
     # --------------------------------------------------------
 
     return _confirmed_venue_from_comment(
@@ -324,7 +479,10 @@ def _download_file(
     ) as response:
         response.raise_for_status()
 
-        with open(path, "wb") as file:
+        with open(
+            path,
+            "wb",
+        ) as file:
             for chunk in response.iter_content(
                 chunk_size=1024 * 1024
             ):
@@ -539,14 +697,17 @@ class ArxivRetriever(BaseRetriever):
         )
 
         # ----------------------------------------------------
-        # Get latest papers from arXiv RSS feed
+        # Get latest papers from arXiv RSS feed.
         # ----------------------------------------------------
 
         feed = feedparser.parse(
             f"https://rss.arxiv.org/atom/{query}"
         )
 
-        if "Feed error for query" in feed.feed.title:
+        if (
+            "Feed error for query"
+            in feed.feed.title
+        ):
             raise Exception(
                 f"Invalid ARXIV_QUERY: {query}."
             )
@@ -560,11 +721,11 @@ class ArxivRetriever(BaseRetriever):
         )
 
         all_paper_ids = [
-            i.id.removeprefix(
+            entry.id.removeprefix(
                 "oai:arXiv.org:"
             )
-            for i in feed.entries
-            if i.get(
+            for entry in feed.entries
+            if entry.get(
                 "arxiv_announce_type",
                 "new",
             )
@@ -572,7 +733,7 @@ class ArxivRetriever(BaseRetriever):
         ]
 
         # ----------------------------------------------------
-        # Debug/Test mode only retrieves first 10 papers.
+        # Test/debug only examines the first 10 papers.
         # ----------------------------------------------------
 
         if self.config.executor.debug:
@@ -581,7 +742,7 @@ class ArxivRetriever(BaseRetriever):
             )
 
         # ----------------------------------------------------
-        # Get complete metadata from arXiv API
+        # Retrieve complete arXiv metadata.
         # ----------------------------------------------------
 
         bar = tqdm(
@@ -653,18 +814,16 @@ class ArxivRetriever(BaseRetriever):
         # ====================================================
         # STRICT VENUE FILTER
         #
-        # IMPORTANT:
-        #
         # Filtering happens BEFORE convert_to_paper().
         #
-        # Rejected papers therefore do NOT:
+        # Therefore rejected papers will NOT:
+        #
         # - download TeX
         # - download HTML
         # - download PDF
         # - extract full text
-        # - enter reranking
+        # - enter Zotero reranking
         #
-        # This greatly reduces GitHub Actions runtime.
         # ====================================================
 
         before_count = len(
@@ -778,7 +937,7 @@ class ArxivRetriever(BaseRetriever):
             )
 
         # ----------------------------------------------------
-        # Final fallback: download PDF.
+        # Final fallback: PDF.
         # ----------------------------------------------------
 
         if full_text is None:
